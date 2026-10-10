@@ -1,0 +1,6 @@
+interface:
+  display_name: "剧组报销"
+  short_description: "按需整理铁路电子客票、核验工作簿并制作中文剧组完整报销提交包"
+  default_prompt: "使用 $prepare-reimbursement-submission 按本次范围整理铁路客票或制作、核验剧组报销材料。"
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verified railway ticket metadata",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "required": ["source", "name", "amount", "origin", "destination", "status"],
+    "properties": {
+      "source": {"type": "string", "minLength": 1, "description": "源目录内 PDF 的相对路径"},
+      "name": {"type": "string"},
+      "amount": {"type": "string"},
+      "origin": {"type": "string"},
+      "destination": {"type": "string"},
+      "status": {"enum": ["完成", "待确认"]},
+      "note": {"type": "string"}
+    },
+    "allOf": [{
+      "if": {"properties": {"status": {"const": "完成"}}},
+      "then": {"properties": {
+        "name": {"minLength": 1},
+        "amount": {"pattern": "^\\d+\\.\\d{2}$"},
+        "origin": {"minLength": 1},
+        "destination": {"minLength": 1}
+      }}
+    }],
+    "additionalProperties": false
+  }
+}
