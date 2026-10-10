@@ -15,6 +15,8 @@ python scripts/ledger_context.py --workbook <最新xlsx> --day <本次日期目�
 
 默认只输出末尾四行、汇总、变动范围与最多八项来源变化。全部差异保存在 `--output`，需要时按范围提取，不把整份状态再打印。可用 `--sheet` 指定工作表。导出文件名每次不同但指向同一在线工作表时，用稳定的 `--source-id`（文档 ID + 子表 ID）匹配；此 ID 不验证导出新鲜度。首次使用先运行 `--help`，无需读取脚本全文。
 
+上面的 scripts/ 是技能目录相对路径；从其他工作目录执行时传入脚本实际路径，业务输入/输出用本次路径。不同模板用列映射参数，迁移照片用 `--order-file` 保留原创建顺序；配置、参数和输入上限见 [project-settings.md](project-settings.md)。inventory 只创建新 JSON；观察快照只能覆盖已识别为同类快照的辅助文件，不能覆盖工作簿、基线或无关 JSON。
+
 脚本只观察，不改工作簿、不访问网络、不读图片像素、不生成“已核实”标记。工作簿用内容 SHA-256，行签名解析文本/公式/缓存值，布局签名覆盖样式、尺寸、合并、图像与关系；照片比较 SHA-256 和 CreationTime。排序或插行会保守地扩大变化范围。布局变化不意味着需要重识别所有收据。
 
 ## 识别结果复用条件
@@ -42,7 +44,7 @@ python scripts/ledger_context.py --workbook <最新xlsx> --day <本次日期目�
 
 ## 参考依据
 
-以下为通用方法；采购边界和失效条件来自本项目要求。核实于 2026-10-08。
+以下为通用方法；采购协作边界和失效条件是技能的业务约定。来源核实于 2026-10-08。
 
 - [Anthropic：上下文工程](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)：按需取资料、用路径引用及持久化工作记录维持长任务。
 - [Anthropic：MCP 与代码执行](https://www.anthropic.com/engineering/code-execution-with-mcp)：在代码中筛选大型表格和中间结果，再返回相关信息。

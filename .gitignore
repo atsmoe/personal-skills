@@ -9,6 +9,7 @@ venv/
 .env.*
 !.env.example
 secrets/
+.purchase-ledger.json
 *-token.txt
 
 # Local task output and business files

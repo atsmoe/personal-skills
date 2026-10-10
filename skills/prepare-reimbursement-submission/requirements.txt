@@ -1,0 +1,2 @@
+# Validated dependency version; not a guarantee against future parser vulnerabilities.
+PyMuPDF==1.28.2

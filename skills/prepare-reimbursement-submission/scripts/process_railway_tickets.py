@@ -13,7 +13,17 @@ import zipfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from render_pdf_evidence import RENDER_PARAMETERS, render_one, sha256, version_info
+from render_pdf_evidence import (RENDER_PARAMETERS, RenderLimits, add_limit_arguments, check_pdf_limits,
+                                 limits_from_args, preflight_pdfs, render_one, sha256, version_info)
+
+
+def csv_display(value):
+    """Visible inert text for CSV readers; authoritative values remain in JSON."""
+    text = str(value)
+    # Include ASCII/full-width prefixes and leading controls/whitespace.
+    if text.lstrip().startswith(('=', '+', '-', '@', '＝', '＋', '－', '＠')) or text.startswith(('\t', '\r', '\n')):
+        return '[文本] ' + text
+    return text
 
 
 def clean_part(value: str) -> str:
@@ -61,9 +71,13 @@ def preflight(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path 
         if zip_path.is_relative_to(input_dir) or zip_path.is_relative_to(output_dir):
             raise ValueError('ZIP 必须位于源目录和候选输出目录之外')
 
+    if metadata.stat().st_size > 4 * 1024 * 1024:
+        raise ValueError('元数据不得超过 4 MiB')
     items = json.loads(metadata.read_text(encoding='utf-8-sig'))
     if not isinstance(items, list) or not items:
         raise ValueError('metadata 必须是非空数组')
+    if len(items) > RenderLimits().documents:
+        raise ValueError('票据数量超过单批限制；请分批处理')
     required = {'source', 'name', 'amount', 'origin', 'destination', 'status'}
     seen = set()
     for item in items:
@@ -73,6 +87,8 @@ def preflight(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path 
             raise ValueError('元数据字段必须是字符串，状态为完成或待确认')
         if not isinstance(item.get('note', ''), str):
             raise ValueError('备注必须是字符串')
+        if any(len(item.get(key, '')) > 10000 for key in (*required, 'note')):
+            raise ValueError('元数据字段过长')
         relative = Path(item['source'])
         source = (input_dir / relative).resolve()
         if relative.is_absolute() or not source.is_relative_to(input_dir):
@@ -86,17 +102,37 @@ def preflight(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path 
             raise ValueError(f'同一源文件重复列出：{item["source"]}')
         seen.add(source)
         if item['status'] == '完成':
-            build_stem(item)
+            if len(build_stem(item)) > 100:
+                raise ValueError('生成的文件名过长；请明确缩写后重试')
     actual = {p.resolve() for p in input_dir.rglob('*') if p.is_file() and p.suffix.lower() == '.pdf'}
     if seen != actual:
         raise ValueError('metadata 必须逐份覆盖源目录中的全部 PDF，不遗漏或重复')
     return items
 
 
-def process(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path | None = None) -> dict:
+def process(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path | None = None,
+            limits: RenderLimits | None = None) -> dict:
     input_dir, metadata, output_dir = input_dir.resolve(), metadata.resolve(), output_dir.resolve()
     zip_path = zip_path.resolve() if zip_path else None
     items = preflight(input_dir, metadata, output_dir, zip_path)
+    limits = limits or RenderLimits()
+    source_paths = [(input_dir / item['source']).resolve() for item in items]
+    # Resource violations fail before output; broken PDFs retain the existing
+    # pending-result behavior, without bypassing aggregate limits for good PDFs.
+    readable = []
+    for path in source_paths:
+        if path.stat().st_size > limits.pdf_bytes:
+            raise ValueError('PDF exceeds source byte limit')
+        try:
+            check_pdf_limits(path, limits)
+            readable.append(path)
+        except ValueError:
+            raise
+        except Exception:
+            pass
+    if sum(p.stat().st_size for p in source_paths) > limits.total_source_bytes:
+        raise ValueError('PDF batch exceeds source byte limit')
+    preflight_pdfs(readable, limits)
     output_dir.mkdir(parents=True, exist_ok=False)
     pdf_dir, png_dir = output_dir / 'PDF', output_dir / 'PDF转PNG'
     pdf_dir.mkdir()
@@ -119,7 +155,7 @@ def process(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path | 
             'render': None,
         }
         try:
-            record['render'] = render_one(target_pdf, pdf_dir, png_dir)
+            record['render'] = render_one(target_pdf, pdf_dir, png_dir, limits)
         except RuntimeError as exc:
             record['status'] = '待确认'
             record['note'] = '; '.join(filter(None, [record['note'], str(exc)]))
@@ -135,9 +171,10 @@ def process(input_dir: Path, metadata: Path, output_dir: Path, zip_path: Path | 
             item = record['metadata']
             pages = (record['render'] or {}).get('pages', [])
             amount = normalize_amount(item['amount']) if item['status'] == '完成' else item['amount']
-            writer.writerow([record['number'], record['source'], item['name'], amount, item['origin'],
-                             item['destination'], record['pdf'], ' | '.join(p['rendered_relative_path'] for p in pages),
-                             record['status'], record['note']])
+            writer.writerow([csv_display(v) for v in
+                             [record['number'], record['source'], item['name'], amount, item['origin'],
+                              item['destination'], record['pdf'], ' | '.join(p['rendered_relative_path'] for p in pages),
+                              record['status'], record['note']]])
     summary = {
         'pdf_count': len(records), 'png_count': len(list(png_dir.glob('*.png'))),
         'completed': sum(r['status'] == '完成' for r in records),
@@ -170,9 +207,10 @@ def main() -> int:
     parser.add_argument('--metadata', required=True, type=Path)
     parser.add_argument('--output-dir', required=True, type=Path)
     parser.add_argument('--zip', dest='zip_path', type=Path)
+    add_limit_arguments(parser)
     args = parser.parse_args()
     try:
-        summary = process(args.input_dir, args.metadata, args.output_dir, args.zip_path)
+        summary = process(args.input_dir, args.metadata, args.output_dir, args.zip_path, limits_from_args(args))
         print(json.dumps(summary, ensure_ascii=False))
         return 2 if summary['pending'] else 0
     except Exception as exc:

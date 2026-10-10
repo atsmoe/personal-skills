@@ -8,13 +8,13 @@ from pathlib import Path
 import re
 import sys
 import xml.etree.ElementTree as ET
-import zipfile
+from bounded_xlsx import BoundedXlsx
 
 if hasattr(sys.stdout,'reconfigure'):sys.stdout.reconfigure(encoding='utf-8')
 
 NS={'s':'http://schemas.openxmlformats.org/spreadsheetml/2006/main','r':'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
 
-def check_drawing_geometry(z,member,sh_xml):
+def check_drawing_geometry(z,member,sh_xml,padding_x=14,padding_y=8,digit_width=7):
     """Use the saved sheet dimensions and merged hosts for both anchor types."""
     errors=[]
     x={'x':'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'}
@@ -27,7 +27,7 @@ def check_drawing_geometry(z,member,sh_xml):
         width=default_width
         for c in columns:
             if int(c.attrib['min'])<=col<=int(c.attrib['max']):width=float(c.attrib.get('width',default_width))
-        return math.floor(width*7+5)*9525
+        return math.floor(width*digit_width+5)*9525
     def rh(row):return heights.get(row,default_height*12700)
     def address(ref):
         letters,number=re.fullmatch(r'([A-Z]+)(\d+)',ref).groups();col=0
@@ -61,13 +61,13 @@ def check_drawing_geometry(z,member,sh_xml):
                 cy=sum(rh(r) for r in range(row,to_row))+int(to.find('x:rowOff',x).text)-int(fr.find('x:rowOff',x).text)
             prefix=f'Drawing {idx} (Rows {host[0]}-{host[2]})'
             if cx<=0 or cy<=0:errors.append(prefix+': invalid extent')
-            if ox<14*9525-2 or w-ox-cx<14*9525-2:errors.append(prefix+': horizontal padding below 14px or overflow')
-            if oy<8*9525-2 or h-oy-cy<8*9525-2:errors.append(prefix+': vertical padding below 8px or overflow')
+            if ox<padding_x*9525-2 or w-ox-cx<padding_x*9525-2:errors.append(prefix+f': horizontal padding below {padding_x}px or overflow')
+            if oy<padding_y*9525-2 or h-oy-cy<padding_y*9525-2:errors.append(prefix+f': vertical padding below {padding_y}px or overflow')
             if abs(2*ox+cx-w)>2 or abs(2*oy+cy-h)>2:errors.append(prefix+': image is not centered in its host')
     return errors
 
-def check(path,sheet_name,expected,check_drawings=False):
-    with zipfile.ZipFile(path) as z:
+def check(path,sheet_name,expected,check_drawings=False,padding_x=14,padding_y=8,digit_width=7):
+    with BoundedXlsx(path) as z:
         book=ET.fromstring(z.read('xl/workbook.xml'))
         sheets=book.findall('s:sheets/s:sheet',NS)
         sheet=next((s for s in sheets if s.attrib['name']==sheet_name),None) if sheet_name else sheets[0]
@@ -98,7 +98,7 @@ def check(path,sheet_name,expected,check_drawings=False):
             if got is None:errors.append(f'{ref}: no cached result; recalculate with Excel or a formula-capable tool before verifying')
             elif abs(Decimal(got)-Decimal(str(want)))>Decimal('0.001'):errors.append(f'{ref}: expected {want}, found {got}')
         if check_drawings:
-            errors.extend(check_drawing_geometry(z,member,ET.fromstring(z.read(member))))
+            errors.extend(check_drawing_geometry(z,member,ET.fromstring(z.read(member)),padding_x,padding_y,digit_width))
         return {'worksheet':sheet.attrib['name'],'expected_cells':totals,'errors':errors}
 
 def main():
@@ -107,10 +107,15 @@ def main():
     parser.add_argument('--sheet')
     parser.add_argument('--expect',action='append',default=[],help='Example H45=3716; repeatable')
     parser.add_argument('--check-drawings',action='store_true',help='Verify all drawings fit strictly within their target cells')
+    parser.add_argument('--padding-x',type=float,default=14,help='Required horizontal image padding in pixels')
+    parser.add_argument('--padding-y',type=float,default=8,help='Required vertical image padding in pixels')
+    parser.add_argument('--digit-width',type=float,default=7,help='Calibrated default-font digit width in pixels')
     args=parser.parse_args();expected={}
+    if not all(math.isfinite(v) and 0 <= v <= 1000 for v in (args.padding_x,args.padding_y)) or not math.isfinite(args.digit_width) or not 0 < args.digit_width <= 100:
+        parser.error('Invalid padding or font digit width')
     for arg in args.expect:
         ref,number=arg.split('=',1);expected[ref.upper()]=Decimal(number)
-    report=check(args.workbook,args.sheet,expected,check_drawings=args.check_drawings)
+    report=check(args.workbook,args.sheet,expected,check_drawings=args.check_drawings,padding_x=args.padding_x,padding_y=args.padding_y,digit_width=args.digit_width)
     print(json.dumps(report,ensure_ascii=False))
     raise SystemExit(1 if report['errors'] else 0)
 

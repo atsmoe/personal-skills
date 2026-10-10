@@ -1,0 +1,32 @@
+{
+  "schema": "purchase-ledger-project/v1",
+  "workbook": "采购明细表.xlsx",
+  "source_root": ".",
+  "sheet": null,
+  "authoritative_source": "confirm",
+  "online_url": null,
+  "header_row": 2,
+  "columns": {
+    "label": "A",
+    "date": "B",
+    "name": "C",
+    "spec": "D",
+    "quantity": "E",
+    "unit": "F",
+    "unit_price": "G",
+    "amount": "H",
+    "scene": "I",
+    "photo": "J"
+  },
+  "format": {
+    "font": null,
+    "body_size_pt": null,
+    "title_size_pt": null,
+    "detail_height_pt": null,
+    "online_detail_height_px": null,
+    "padding_x_px": 14,
+    "padding_y_px": 8,
+    "digit_width_px": 7
+  },
+  "manual_date_assignments": []
+}

@@ -22,7 +22,7 @@
 
 ## 执行与输出
 
-依赖 Python 和 PyMuPDF。先运行 `--help`，确认当前环境能导入 PyMuPDF，再执行：
+依赖 Python 3.10+ 和 PyMuPDF；按技能根目录 requirements.txt 安装本次验证版本。脚本路径相对技能目录，输入/输出可以在任何当前设备目录。先运行 `--help`，确认能导入 PyMuPDF，再执行：
 
 ```text
 python scripts/process_railway_tickets.py --input-dir <源PDF目录> --metadata <已核实JSON> --output-dir <全新候选目录> --zip <候选目录之外的新ZIP路径>
@@ -42,6 +42,14 @@ python scripts/process_railway_tickets.py --input-dir <源PDF目录> --metadata 
 - 复用 [render_pdf_evidence.py](../scripts/render_pdf_evidence.py)，固定 300 DPI、RGB、整页逐页渲染。原始文件与改名副本逐个比较 SHA-256，来源清单保留原始路径、改名映射、渲染器版本、每页 PNG 及哈希。发生渲染错误时记录待确认，保留候选结果、不生成 ZIP，不报全部成功；失败留下的局部 PNG 不作为已验收证据。
 - 可选 ZIP 仅收录 `PDF/` 和 `PDF转PNG/`，不含报告或来源清单。这是客票附件整理包；组装正式报销材料 ZIP 时按 [submission-standard.md](submission-standard.md) 只收录人员材料文件夹与原始证据，不把 PDF 派生 PNG、中间报告或该候选 ZIP 再套入正式包。
 - 退出码 `0` 表示文件处理通过，`2` 表示存在待确认项，`1` 表示输入或执行失败。元数据内容是否与票面一致、渲染文字是否可读，仍由代理核对，退出码不证明这些结论。
+
+## 输入与输出保护
+
+渲染前默认限制：每批200份 PDF、单份100 MiB、原文件合计512 MiB、每份500页、单页4000万像素、全批1000页及2.5亿像素（按300 DPI估算）。元数据最多4 MiB，字段最长10000字符。超限先分批；可信特殊材料可明确使用 `--max-pages`、`--max-page-pixels`、`--max-total-pages`、`--max-total-pixels` 调整页/像素预算，不自动放宽。不支持加密/不可读 PDF 的渲染。
+
+独立渲染器要求全新输出目录，`--manifest` 必须为该目录内的新 JSON，拒绝源/输出交叠与跨源根目录的文件链接。脚本不会删除失败结果，重跑选新候选目录，不能把局部失败 PNG 当已验收页。路径检查不隔离同一系统上有权限并发修改目录的其他进程；不可信 PDF 宜在受限进程/环境中处理，页数/像素预算也不是解析器安全沙箱。
+
+CSV 仅供人工查看：以 `= + - @`（含全角）、控制字符或空白后公式前缀开头的文字添加可见 `[文本] ` 前缀，避免被直接当公式。原始元数据在来源清单 JSON 中保留不变；不要从显示报告反推或回写原值。JSON 才是程序接续的输入。Excel 实际执行公式未作为验收步骤，测试仅检查序列化后的危险前缀已去除。
 
 ## 验收与交付
 

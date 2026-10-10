@@ -58,6 +58,8 @@ pix.save(output_png)
 
 技能附带的 `scripts/render_pdf_evidence.py` 负责批量渲染并生成基础JSON；人员、明细行和Excel锚点可在后续总来源清单中补充。
 
+脚本要求新的候选目录，清单必须位于候选目录内；不允许写回原件目录或覆盖已有结果。渲染前检查文件、页数及像素预算，限制与跨设备参数见 [railway-tickets.md](railway-tickets.md) 的输入与输出保护。输入超限应分批，不自动关闭限制。
+
 ## 4. 原始栅格图片
 
 - PNG/JPG/JPEG等优先直接按原始文件字节插入Excel。

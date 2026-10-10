@@ -1,7 +1,6 @@
 """Observe an XLSX and optional date-folder images; emit bounded context, never edit sources."""
 import argparse
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -9,9 +8,9 @@ import posixpath
 import re
 import sys
 import xml.etree.ElementTree as ET
-from zipfile import ZipFile
 
 from inventory import inventory
+from bounded_xlsx import BoundedXlsx, file_hash
 
 NS = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
       'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
@@ -30,9 +29,8 @@ def text_nodes(node):
     return ''.join(t.text or '' for t in node.findall('.//s:t', NS))
 
 
-def workbook_snapshot(path, sheet_name=None, source_id=None):
-    raw = path.read_bytes()
-    with ZipFile(io.BytesIO(raw)) as z:
+def workbook_snapshot(path, sheet_name=None, source_id=None, label_column='A', amount_column='H'):
+    with BoundedXlsx(path) as z:
         book = ET.fromstring(z.read('xl/workbook.xml'))
         sheets = book.findall('s:sheets/s:sheet', NS)
         sheet = next((s for s in sheets if s.get('name') == sheet_name), None) if sheet_name else sheets[0]
@@ -68,19 +66,19 @@ def workbook_snapshot(path, sheet_name=None, source_id=None):
             if records:
                 row_number = row.get('r')
                 rows[row_number] = records
-                label = next((c['value'] for c in records if c['cell'] == 'A' + row_number), None)
+                label = next((c['value'] for c in records if c['cell'] == label_column + row_number), None)
                 if isinstance(label, str) and any(t in label for t in ['小结', '总计', '合计']):
-                    amount = next((c for c in records if c['cell'] == 'H' + row_number), {})
+                    amount = next((c for c in records if c['cell'] == amount_column + row_number), {})
                     totals.append({'row': int(row_number), 'label': label,
                                    'cached_amount': amount.get('value'), 'formula': amount.get('formula')})
         layout_nodes = {}
         for tag in ['cols', 'sheetFormatPr', 'mergeCells', 'drawing']:
             node = root.find('s:' + tag, NS)
             layout_nodes[tag] = ET.tostring(node, encoding='unicode') if node is not None else None
-        part_hashes = {n: digest(z.read(n)) for n in z.namelist()
+        part_hashes = {n: z.part_hash(n) for n in z.namelist()
                        if n == 'xl/styles.xml' or n.startswith(('xl/drawings/', 'xl/media/', 'xl/worksheets/_rels/'))}
         snapshot = {'source_id': source_id or identity(path), 'file': str(path.resolve()),
-                    'sheet': sheet.get('name'), 'sha256': digest(raw),
+                    'sheet': sheet.get('name'), 'sha256': file_hash(path),
                     'row_hashes': {r: digest(cells) for r, cells in rows.items()},
                     'layout_hash': digest([layout_nodes, row_dimensions, style_refs, part_hashes])}
         return snapshot, {'rows': rows, 'totals': totals, 'formula_errors': errors, 'missing_formula_caches': uncached}
@@ -106,11 +104,15 @@ def short(value):
     return value
 
 
-def observe(workbook, day=None, sheet=None, source_id=None, baseline=None, tail=4, maximum=8):
-    current, facts = workbook_snapshot(workbook, sheet, source_id)
+def observe(workbook, day=None, sheet=None, source_id=None, baseline=None, tail=4, maximum=8,
+            order_file=None, label_column='A', amount_column='H', name_column='C', header_row=2):
+    current, facts = workbook_snapshot(workbook, sheet, source_id, label_column, amount_column)
+    current['mapping'] = [label_column, amount_column, name_column, header_row]
     previous, baseline_status = None, 'missing'
     if baseline is not None:
         try:
+            if baseline.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError('Baseline exceeds 16 MiB')
             document = json.loads(baseline.read_text(encoding='utf-8-sig'))
             previous = document['snapshot']
             old = previous['workbook']
@@ -120,7 +122,7 @@ def observe(workbook, day=None, sheet=None, source_id=None, baseline=None, tail=
             if previous.get('schema') != 1 or not valid_hashes:
                 baseline_status = 'incompatible'
             else:
-                baseline_status = 'matched' if (old['source_id'], old['sheet']) == (current['source_id'], current['sheet']) else 'incompatible'
+                baseline_status = 'matched' if (old['source_id'], old['sheet'], old.get('mapping', ['A', 'H', 'C', 2])) == (current['source_id'], current['sheet'], current['mapping']) else 'incompatible'
         except (OSError, ValueError, KeyError, TypeError):
             previous, baseline_status = None, 'invalid'
     matched = baseline_status == 'matched'
@@ -132,7 +134,7 @@ def observe(workbook, day=None, sheet=None, source_id=None, baseline=None, tail=
                'layout_or_images_changed': current['layout_hash'] != previous['workbook'].get('layout_hash') if matched else None}
     photos, photo_changes = None, None
     if day is not None:
-        inv = inventory(day)
+        inv = inventory(day, order_file)
         photos = {'folder': identity(day), 'files': {p['file']: {'sha256': p['sha256'], 'creation_timestamp': p['creation_timestamp']} for p in inv['images']}}
         old_photos = previous.get('photos') if matched and previous is not None else None
         photo_match = isinstance(old_photos, dict) and old_photos.get('folder') == photos['folder'] and isinstance(old_photos.get('files'), dict)
@@ -145,11 +147,11 @@ def observe(workbook, day=None, sheet=None, source_id=None, baseline=None, tail=
     def meaningful(r):
         cells = facts['rows'][r]
         # Templates may pre-fill A with sequence numbers far below actual purchases.
-        return any(c['cell'] != 'A' + r or (c['value'] is not None and
+        return any(c['cell'] != label_column + r or (c['value'] is not None and
                    not re.fullmatch(r'-?\d+(?:\.\d+)?', str(c['value']))) for c in cells)
     ledger_rows = [r for r in row_numbers if meaningful(r)]
-    detail_rows = [r for r in row_numbers if int(r) > 2 and
-                   any(c['cell'] == 'C' + r and c['value'] not in [None, ''] for c in facts['rows'][r])]
+    detail_rows = [r for r in row_numbers if int(r) > header_row and
+                   any(c['cell'] == name_column + r and c['value'] not in [None, ''] for c in facts['rows'][r])]
     selected = ledger_rows[-tail:] if tail else []
     tail_rows = [{'row': int(r), 'cells': [{'cell': c['cell'], 'value': short(c['value']), 'formula': short(c['formula'])} for c in facts['rows'][r][:10]],
                   'omitted_cells': max(0, len(facts['rows'][r]) - 10)} for r in selected]
@@ -184,24 +186,39 @@ def main():
     parser.add_argument('--workbook', required=True, type=Path)
     parser.add_argument('--day', type=Path, help='Only scan this date folder; no recursive image scan')
     parser.add_argument('--sheet')
+    parser.add_argument('--order-file', type=Path, help='Original-device image inventory for migrated images')
+    parser.add_argument('--label-column', default='A')
+    parser.add_argument('--amount-column', default='H')
+    parser.add_argument('--name-column', default='C')
+    parser.add_argument('--header-row', type=int, default=2)
     parser.add_argument('--source-id', help='Stable document+sheet identity when export filenames change; not a freshness guarantee')
     parser.add_argument('--baseline', type=Path, help='Earlier observation JSON; never an OCR verification certificate')
     parser.add_argument('--output', required=True, type=Path, help='Auxiliary JSON containing the snapshot and all differences')
     parser.add_argument('--tail', type=int, default=4)
     parser.add_argument('--max-items', type=int, default=8)
     args = parser.parse_args()
+    for key in ('label_column', 'amount_column', 'name_column'):
+        value = getattr(args, key).upper()
+        if not re.fullmatch(r'[A-Z]{1,3}', value) or not 1 <= sum((ord(c)-64)*26**i for i,c in enumerate(reversed(value))) <= 16384:
+            parser.error('Column mapping must use Excel column letters A..XFD')
+        setattr(args, key, value)
+    if not 1 <= args.header_row <= 1048576:
+        parser.error('Invalid header row')
     if not 0 <= args.tail <= 20 or not 1 <= args.max_items <= 50:
         parser.error('tail must be 0..20; max-items must be 1..50')
     if args.output.suffix.lower() != '.json' or any(identity(args.output) == identity(p) for p in [args.workbook, args.baseline] if p is not None):
         parser.error('Output must be a separate auxiliary JSON, not the workbook or baseline')
     if args.output.exists():
         try:
+            if args.output.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError('Existing auxiliary JSON exceeds 16 MiB')
             existing = json.loads(args.output.read_text(encoding='utf-8-sig'))
             if existing.get('snapshot', {}).get('schema') != 1:
                 raise ValueError('Not an observation snapshot')
         except (OSError, ValueError, AttributeError, TypeError):
             parser.error('Refusing to overwrite an unrelated JSON; choose a context snapshot output path')
-    report = observe(args.workbook, args.day, args.sheet, args.source_id, args.baseline, args.tail, args.max_items)
+    report = observe(args.workbook, args.day, args.sheet, args.source_id, args.baseline, args.tail, args.max_items,
+                     args.order_file, args.label_column, args.amount_column, args.name_column, args.header_row)
     report['summary']['details_path'] = str(args.output.resolve())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
