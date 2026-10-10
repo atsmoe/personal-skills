@@ -1,0 +1,4 @@
+interface:
+  display_name: "照片转采购明细"
+  short_description: "按日期增量整理采购照片，覆盖本地来源、保留在线他人增补并列出额外条目"
+  default_prompt: "使用 $photo-purchase-ledger 将指定日期的收据与实物照片整理到原采购表后面。"

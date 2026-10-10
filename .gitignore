@@ -1,0 +1,27 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+secrets/
+*-token.txt
+
+# Local task output and business files
+.work_*/
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.log
+*.tmp
+*.zip
+~$*
+
+# Desktop metadata
+.DS_Store
+Thumbs.db
