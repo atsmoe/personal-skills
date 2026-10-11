@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 
 from inventory import inventory
 from bounded_xlsx import BoundedXlsx, file_hash
+from ledger_io import add_summary_arguments, emit_summary
 
 NS = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
       'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
@@ -196,6 +197,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path, help='Auxiliary JSON containing the snapshot and all differences')
     parser.add_argument('--tail', type=int, default=4)
     parser.add_argument('--max-items', type=int, default=8)
+    add_summary_arguments(parser)
     args = parser.parse_args()
     for key in ('label_column', 'amount_column', 'name_column'):
         value = getattr(args, key).upper()
@@ -206,6 +208,8 @@ def main():
         parser.error('Invalid header row')
     if not 0 <= args.tail <= 20 or not 1 <= args.max_items <= 50:
         parser.error('tail must be 0..20; max-items must be 1..50')
+    if not 512 <= args.max_chars <= 5000:
+        parser.error('max-chars must be 512..5000')
     if args.output.suffix.lower() != '.json' or any(identity(args.output) == identity(p) for p in [args.workbook, args.baseline] if p is not None):
         parser.error('Output must be a separate auxiliary JSON, not the workbook or baseline')
     if args.output.exists():
@@ -220,9 +224,12 @@ def main():
     report = observe(args.workbook, args.day, args.sheet, args.source_id, args.baseline, args.tail, args.max_items,
                      args.order_file, args.label_column, args.amount_column, args.name_column, args.header_row)
     report['summary']['details_path'] = str(args.output.resolve())
+    report['summary'].update(status='observed', check_complete=True,
+                             error_count=len(report['formula_errors']),
+                             missing_cache_count=len(report['missing_formula_caches']))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(json.dumps(report['summary'], ensure_ascii=False))
+    emit_summary(report['summary'], args.max_chars)
 
 
 if __name__ == '__main__':

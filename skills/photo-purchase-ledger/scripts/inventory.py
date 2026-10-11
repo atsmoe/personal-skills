@@ -7,6 +7,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from ledger_io import add_summary_arguments, emit_summary
 
 IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
 MAX_IMAGE_BYTES = 100 * 1024 * 1024
@@ -84,7 +85,11 @@ def main():
     parser.add_argument('--day', required=True, type=Path)
     parser.add_argument('--order-file', type=Path, help='Original-device inventory, verified by image SHA-256')
     parser.add_argument('--output', type=Path, help='New auxiliary JSON inside the date folder; existing files are never overwritten')
+    parser.add_argument('--max-items', type=int, default=10, help='Maximum groups and group members in the summary (0..50)')
+    add_summary_arguments(parser)
     args = parser.parse_args()
+    if not 0 <= args.max_items <= 50 or not 512 <= args.max_chars <= 5000:
+        parser.error('max-items must be 0..50; max-chars must be 512..5000')
     day = args.day.resolve()
     if not day.is_dir():
         parser.error('Date folder does not exist')
@@ -95,8 +100,13 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x', encoding='utf-8') as stream:
         json.dump(result, stream, ensure_ascii=False, indent=2)
-    print(json.dumps({'output': str(output), 'time_ties': result['time_ties'],
-                      'duplicate_bytes': result['duplicate_bytes']}, ensure_ascii=False))
+    def bounded(items):
+        return {'items': items[:args.max_items], 'omitted': max(0, len(items)-args.max_items)}
+    emit_summary({'output': str(output), 'status': 'observed', 'check_complete': True,
+                  'time_tie_group_count': len(result['time_ties']),
+                  'duplicate_group_count': len(result['duplicate_bytes']),
+                  'time_ties': bounded([bounded(group) for group in result['time_ties']]),
+                  'duplicate_bytes': bounded([bounded(group) for group in result['duplicate_bytes']])}, args.max_chars)
 
 
 if __name__ == '__main__':

@@ -9,6 +9,8 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from bounded_xlsx import BoundedXlsx
+from ledger_io import add_summary_arguments, emit_summary, error_summary, write_new_json
+from uuid import uuid4
 
 if hasattr(sys.stdout,'reconfigure'):sys.stdout.reconfigure(encoding='utf-8')
 
@@ -110,13 +112,27 @@ def main():
     parser.add_argument('--padding-x',type=float,default=14,help='Required horizontal image padding in pixels')
     parser.add_argument('--padding-y',type=float,default=8,help='Required vertical image padding in pixels')
     parser.add_argument('--digit-width',type=float,default=7,help='Calibrated default-font digit width in pixels')
+    parser.add_argument('--max-errors',type=int,default=10,help='Maximum representative errors in the summary (0..100)')
+    parser.add_argument('--report',type=Path,help='New auxiliary JSON with every check result and error')
+    add_summary_arguments(parser)
     args=parser.parse_args();expected={}
+    if not 0 <= args.max_errors <= 100 or not 512 <= args.max_chars <= 5000:
+        parser.error('max-errors must be 0..100; max-chars must be 512..5000')
     if not all(math.isfinite(v) and 0 <= v <= 1000 for v in (args.padding_x,args.padding_y)) or not math.isfinite(args.digit_width) or not 0 < args.digit_width <= 100:
         parser.error('Invalid padding or font digit width')
     for arg in args.expect:
         ref,number=arg.split('=',1);expected[ref.upper()]=Decimal(number)
     report=check(args.workbook,args.sheet,expected,check_drawings=args.check_drawings,padding_x=args.padding_x,padding_y=args.padding_y,digit_width=args.digit_width)
-    print(json.dumps(report,ensure_ascii=False))
+    report_path=args.report or args.workbook.parent / '.work_validation' / ('check-' + uuid4().hex + '.json')
+    report['check_complete']=True
+    report['status']='failed' if report['errors'] else 'passed'
+    try:
+        details_path=write_new_json(report_path,report,protected=[args.workbook])
+        emit_summary({'worksheet':report['worksheet'],'expected_cells':report['expected_cells'],
+                      'status':report['status'],'check_complete':True,'details_path':details_path,
+                      **error_summary(report['errors'],args.max_errors)},args.max_chars)
+    except ValueError as error:
+        parser.error(str(error))
     raise SystemExit(1 if report['errors'] else 0)
 
 if __name__=='__main__':main()
