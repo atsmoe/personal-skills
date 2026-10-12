@@ -13,12 +13,13 @@ from collections import Counter
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from tencent_adapter import TencentAdapter, number, text
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+MAX_SNAPSHOT_AGE = 60
 MAX_JSON = 8 * 1024 * 1024
 SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 ITEM_FIELDS = ("name", "spec", "quantity", "unit", "unit_price", "amount", "note")
-FORBIDDEN = {"待确认", "未知", "可能是", "大概", "猜测值", "待核实"}
 
 
 def now():
@@ -63,35 +64,97 @@ def atomic_save(path, value):
             os.unlink(temporary)
 
 
-def number(value, money=False):
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        raise ValueError("Boolean is not a purchase number")
-    try:
-        result = Decimal(str(value))
-    except InvalidOperation as error:
-        raise ValueError("Invalid purchase number") from error
-    if not result.is_finite() or result < 0 or result > Decimal("1000000000000"):
-        raise ValueError("Purchase number must be finite and nonnegative")
-    if money and result != result.quantize(Decimal("0.01")):
-        raise ValueError("Settlement amount has more than two decimal places")
-    return format(result.quantize(Decimal("0.01")), "f") if money else format(result.normalize(), "f")
-
-
-def text(value):
-    if value is None:
-        return ""
-    if not isinstance(value, str) or len(value) > 2000:
-        raise ValueError("Invalid purchase text")
-    value = value.strip()
-    if any(word in value for word in FORBIDDEN):
-        raise ValueError("Uncertain fields must be empty, not placeholders")
-    return value
-
-
 def active(state):
     return [op for op in state["operations"] if op["status"] in {"prepared", "uncertain"}]
+
+
+class ConflictError(ValueError):
+    """A scoped online observation differs from the durable write baseline."""
+
+
+def compare_versions(before, current):
+    """Compare actual scoped snapshots, not an unsupported document version token."""
+    if before != current:
+        raise ConflictError("Current target differs from the saved snapshot; preserve the external edit")
+
+
+def fresh_evidence(data, earliest=None):
+    if not data.get("evidence") or not isinstance(data.get("captured_at"), str):
+        raise ValueError("Timestamped current Tencent read evidence required")
+    captured = dt.datetime.fromisoformat(data["captured_at"].replace("Z", "+00:00"))
+    if captured.tzinfo is None:
+        raise ValueError("Evidence time must include its timezone")
+    age = (dt.datetime.now(dt.timezone.utc) - captured).total_seconds()
+    if age < -5 or age > MAX_SNAPSHOT_AGE or (earliest and captured < dt.datetime.fromisoformat(earliest.replace("Z", "+00:00"))):
+        raise ValueError("Evidence is stale or predates the operation; read the target again")
+
+
+def stale_summary(state):
+    # Keep the last actual write as a conflict baseline even when a new source arrives.
+    state["summary"] = {**state["summary"], "status": "stale"}
+
+
+def normalized_daily(project, snapshot):
+    rows = snapshot.get("items")
+    if snapshot.get("date") != project.date or not isinstance(rows, list) or len(rows) > 20000:
+        raise ValueError("Fresh full-day snapshot required for the daily summary")
+    return [{key: number(row.get(key), key == "amount") if key in {"quantity", "unit_price", "amount"} else text(row.get(key))
+             for key in ITEM_FIELDS} for row in rows]
+
+
+def daily_fingerprint(rows):
+    # Sorting preserves duplicates while allowing harmless view-order changes.
+    return digest(sorted(canonical(row) for row in rows))
+
+
+def check_current(project, state, data, current):
+    """Check a connector read supplied by the host before recording any write intent."""
+    if not isinstance(current, dict):
+        raise ValueError("Read the current Tencent target before prepare")
+    fresh_evidence(current)
+    if current.get("target") != data["target"] or current.get("date") != project.date:
+        raise ConflictError("Current read target/date does not match the intended write")
+    compare_versions(data["before"], current.get("observed"))
+    structure = data.get("before_structure")
+    if not isinstance(structure, dict) or not structure:
+        raise ValueError("Actual field mapping, date bounds and merged-cell baseline required")
+    compare_versions(structure, current.get("structure"))
+    previous_structure = state.get("structures", {}).get(digest(data["target"]))
+    if previous_structure is not None:
+        compare_versions(previous_structure, current["structure"])
+    guards = current.get("groups")
+    verified = {gid: group for gid, group in state["groups"].items() if group["text_status"] == "verified"}
+    if not isinstance(guards, dict) or set(guards) != set(verified):
+        raise ValueError("Read every previously verified purchase in this date before writing")
+    relocated = {}
+    for gid, group in verified.items():
+        guard = guards[gid]
+        if guard.get("target") != group.get("target") or guard.get("identity_verified") is not True:
+            raise ConflictError("Purchase identity or scoped target changed: " + gid)
+        compare_versions(group["text_snapshot"], guard.get("text"))
+        group_structure = state.get("structures", {}).get(digest(group["target"]))
+        if group_structure is not None:
+            compare_versions(group_structure, guard.get("structure"))
+        if "image_snapshot" in group:
+            compare_versions(group["image_snapshot"], guard.get("image"))
+        locators = TencentAdapter.locators(project.config["document_type"], guard.get("locators"), len(group["items"]))
+        if project.config["document_type"] == "smartsheet":
+            compare_versions(group["locators"], locators)
+        relocated[gid] = locators
+    summary = state["summary"]
+    if data["kind"] == "summary" and "data" in summary:
+        compare_versions(summary["target"], data["target"])
+        compare_versions(summary["data"], current["observed"])
+    return relocated
+
+
+def image_cache_status(state, sha):
+    upload = state["uploads"].get(sha)
+    associated = any(sha in group.get("image_sha256", group["physical_sha256"] if group["image_status"] == "verified" else [])
+                     for group in state["groups"].values())
+    usable = bool(upload and dt.datetime.fromisoformat(upload["expires_at"].replace("Z", "+00:00")) > dt.datetime.now(dt.timezone.utc))
+    return {"sha256": sha, "associated": associated, "usable": usable,
+            "status": "usable" if usable else "expired" if upload else "missing", **(upload or {})}
 
 
 class Project:
@@ -140,7 +203,7 @@ class Project:
     def initial(self):
         return {"schema": "purchase-tencent-daily-state/v1", "version": VERSION,
                 "date": self.date, "file_id": self.month["file_id"], "target_hash": self.target_hash,
-                "photos": {}, "groups": {}, "operations": [], "uploads": {},
+                "photos": {}, "groups": {}, "operations": [], "uploads": {}, "structures": {},
                 "summary": {"status": "pending"}, "revision": 0}
 
     def load(self):
@@ -148,6 +211,12 @@ class Project:
         if (state.get("schema"), state.get("date"), state.get("file_id"), state.get("target_hash")) != (
                 "purchase-tencent-daily-state/v1", self.date, self.month["file_id"], self.target_hash):
             raise ValueError("State identity mismatch")
+        state["version"] = VERSION
+        if "data" not in state["summary"]:
+            previous = next((op for op in reversed(state["operations"]) if op["kind"] == "summary" and op["status"] == "verified"), None)
+            if previous:
+                state["summary"].update(data=previous["observed"], target=previous["target"],
+                                        at=previous.get("resolved_at", previous["at"]))
         return state
 
     def input(self, path):
@@ -242,7 +311,7 @@ def scan(project, state, order_file=None):
     if set(order) - set(current):
         raise ValueError("Order manifest contains a source outside this day's current photo set")
     if set(current) != set(previous):
-        state["summary"] = {"status": "stale"}
+        stale_summary(state)
     state["photos"] = current
     for group in state["groups"].values():
         group["source_missing"] = sorted(set(group["receipt_sha256"] + group["physical_sha256"]) - set(current))
@@ -309,11 +378,11 @@ def identify(project, state, data):
                  "image_status": old["image_status"] if old and old["physical_sha256"] == physical else "pending"}
         state["groups"][group_id] = group
         if changed:
-            state["summary"] = {"status": "stale"}
+            stale_summary(state)
     return status(project, state)
 
 
-def prepare(project, state, data):
+def prepare(project, state, data, read_current=None, *, _adopting=False):
     if active(state):
         raise ValueError("Uncertain operation exists; read back before another submission")
     kind = data.get("kind")
@@ -325,6 +394,15 @@ def prepare(project, state, data):
     before, expected = data.get("before"), data.get("expected")
     if not isinstance(before, dict) or not isinstance(expected, dict) or not expected or before == expected:
         raise ValueError("Distinct normalized before/expected snapshots required")
+    if data.get("observation_only"):
+        raise ValueError("Use adopt for observations; prepare always checks the online write baseline")
+    current = None
+    relocated = {}
+    if not _adopting:
+        # A host can read through its connector here. The CLI consumes the same
+        # envelope from the immediately preceding MCP read; it has no credentials.
+        current = read_current(data) if read_current else data.get("current")
+        relocated = check_current(project, state, data, current)
     group_id = data.get("group_id")
     if kind in {"text", "image"}:
         group = state["groups"].get(group_id)
@@ -339,17 +417,42 @@ def prepare(project, state, data):
                 raise ValueError("Photo association must use the verified text target")
             if project.config["document_type"] == "smartsheet":
                 ids = expected.get("image_ids")
-                if set(expected) != {"image_ids"} or not isinstance(ids, list) or not ids or any(not isinstance(value, str) or not value for value in ids):
+                if set(expected) != {"image_ids"} or not isinstance(ids, list) or not ids or any(not isinstance(value, str) or not value for value in ids) or len(ids) != len(set(ids)):
                     raise ValueError("SmartSheet photo expectation requires actual image IDs")
-                uploads = [state["uploads"].get(sha) for sha in group["physical_sha256"]]
-                if not data.get("observation_only"):
-                    if any(not upload or dt.datetime.fromisoformat(upload["expires_at"]) <= dt.datetime.now(dt.timezone.utc) for upload in uploads):
+                if not _adopting:
+                    old_ids = before.get("image_ids")
+                    if set(before) != {"image_ids"} or not isinstance(old_ids, list) or any(not isinstance(value, str) or not value for value in old_ids):
+                        raise ValueError("Read existing photo IDs before appending")
+                    associated = set(group.get("image_sha256", group["physical_sha256"] if group["image_status"] == "verified" else []))
+                    needed = [sha for sha in group["physical_sha256"] if sha not in associated]
+                    if any(not image_cache_status(state, sha)["usable"] for sha in needed):
                         raise ValueError("Missing or expired upload; refresh before associating")
-                    if sorted(ids) != sorted(upload["image_id"] for upload in uploads):
-                        raise ValueError("Image IDs must match the observed physical sources")
+                    wanted = set(old_ids) | {state["uploads"][sha]["image_id"] for sha in needed}
+                    if set(ids) != wanted:
+                        raise ValueError("Preserve existing photo IDs and append only the cached physical sources")
             elif expected != {"visual_sha256": group["physical_sha256"]}:
                 raise ValueError("SHEET image verification must identify this group's physical originals")
+            elif not _adopting:
+                associated = set(group.get("image_sha256", group["physical_sha256"] if group["image_status"] == "verified" else []))
+                needed = set(group["physical_sha256"]) - associated
+                upload_ids, originals = data.get("upload_ids"), data.get("original_sha256")
+                if (upload_ids is None) == (originals is None):
+                    raise ValueError("SHEET insertion requires cached upload IDs or explicit original-image hashes")
+                if upload_ids is not None:
+                    if not isinstance(upload_ids, dict) or set(upload_ids) != needed or any(
+                            not image_cache_status(state, sha)["usable"] or upload_ids[sha] != state["uploads"][sha]["image_id"] for sha in needed):
+                        raise ValueError("SHEET image IDs must match unexpired source uploads")
+                elif not isinstance(originals, list) or set(originals) != needed or len(originals) != len(needed):
+                    raise ValueError("SHEET insertion must use the actual new physical originals")
+    summary_basis = None
     if kind == "summary":
+        if project.config["document_type"] == "smartsheet":
+            if not isinstance(target.get("record_id"), str) or not target["record_id"]:
+                raise ValueError("Summary requires the actual date-specific record ID")
+        elif not isinstance(target.get("row_index"), int) or isinstance(target["row_index"], bool) or target["row_index"] < 0:
+            raise ValueError("Summary requires the actual date-specific zero-based row")
+        if not _adopting and (set(before) != {"date", "item_count", "daily_amount", "status"} or before["date"] not in {project.date, "", None}):
+            raise ValueError("Summary baseline must be this date's managed fields or a confirmed blank slot")
         if set(expected) != {"date", "item_count", "daily_amount", "status"} or expected["date"] != project.date:
             raise ValueError("Summary must contain only this date's four managed fields")
         if isinstance(expected["item_count"], bool) or not isinstance(expected["item_count"], int) or expected["item_count"] < 0:
@@ -359,30 +462,36 @@ def prepare(project, state, data):
         if expected["status"] == "完成" and not groups_ready(state):
             raise ValueError("Unresolved sources, amounts or images cannot produce a completed summary")
         daily = data.get("daily_snapshot", {})
-        rows = daily.get("items")
-        if daily.get("date") != project.date or not isinstance(rows, list) or len(rows) > 20000:
-            raise ValueError("Fresh full-day snapshot required for the daily summary")
-        normalized = [{key: number(row.get(key), key == "amount") if key in {"quantity", "unit_price", "amount"} else text(row.get(key)) for key in ITEM_FIELDS} for row in rows]
+        if not _adopting:
+            fresh_evidence(daily)
+        normalized = normalized_daily(project, daily)
         present = Counter(canonical(row) for row in normalized)
         owned = Counter(canonical(row) for group in state["groups"].values() if group["text_status"] == "verified" for row in group["items"])
         if owned - present:
             raise ValueError("Daily snapshot omitted or changed a verified purchase")
         total = sum((Decimal(row["amount"]) for row in normalized if row["amount"] is not None), Decimal(0))
-        if expected["item_count"] != len(rows) or number(expected["daily_amount"], True) != format(total, ".2f"):
+        if expected["item_count"] != len(normalized) or expected["daily_amount"] != format(total, ".2f"):
             raise ValueError("Summary must include all current daily purchases, including collaborators")
         if expected["status"] == "完成" and any(row["amount"] is None for row in normalized):
             raise ValueError("Missing daily amounts cannot produce a completed summary")
+        summary_basis = daily_fingerprint(normalized)
     attempt_key = digest({"kind": kind, "group_id": group_id, "target": target, "expected": expected})
     attempts = [op for op in state["operations"] if op["attempt_key"] == attempt_key]
     if any(op["status"] == "verified" for op in attempts):
         raise ValueError("This operation already verified; do not submit it again")
     if len(attempts) >= 2:
         raise ValueError("Retry limit reached; review the failed operation")
+    for gid, locators in relocated.items():
+        state["groups"][gid]["locators"] = locators
     operation_id = "op_" + digest({"key": attempt_key, "revision": state["revision"]})[:24]
+    checked = ({key: current[key] for key in ("captured_at", "evidence", "target", "date")} |
+               {key + "_sha256": digest(current[key]) for key in ("observed", "structure", "groups")}) if current else None
     state["operations"].append({"operation_id": operation_id, "attempt_key": attempt_key,
                                 "kind": kind, "group_id": group_id, "target": target,
                                 "before": before, "expected": expected, "status": "prepared", "at": now(),
-                                "observation_only": data.get("observation_only", False)})
+                                "observation_only": _adopting, "summary_basis": summary_basis,
+                                "before_structure": data.get("before_structure"), "current_evidence": checked,
+                                "image_sha256": state["groups"][group_id]["physical_sha256"][:] if kind == "image" else None})
     return {"operation_id": operation_id, "status": "prepared", "state": str(project.path)}
 
 
@@ -392,61 +501,95 @@ def resolve(project, state, data):
         raise ValueError("Select the pending operation and its exact target")
     if not data.get("evidence") or not isinstance(data.get("observed"), dict):
         raise ValueError("Fresh readback evidence is required")
+    writing = not operation.get("observation_only")
+    if writing:
+        fresh_evidence(data, earliest=operation["at"])
     observed = data["observed"]
     result = "uncertain"
+    structure_matches = True
+    if writing and observed == operation["expected"]:
+        if not isinstance(data.get("structure"), dict) or not data["structure"]:
+            raise ValueError("Read back the affected field mapping and merged-cell structure")
+        wanted_structure = operation["expected"] if operation["kind"] == "structure" else operation.get("before_structure")
+        if wanted_structure is None:
+            if data.get("legacy_readback_reviewed") is not True:
+                raise ValueError("Legacy operation lacks a structure baseline; explicitly review its current target")
+        else:
+            structure_matches = data["structure"] == wanted_structure
+    summary_matches = True
+    if operation["kind"] == "summary" and observed == operation["expected"] and not operation.get("observation_only"):
+        daily = data.get("daily_snapshot", {})
+        fresh_evidence(daily, earliest=operation["at"])
+        rows = normalized_daily(project, daily)
+        if operation.get("summary_basis") is None:
+            if data.get("legacy_readback_reviewed") is not True:
+                raise ValueError("Legacy summary lacks its calculation fingerprint; review the full current date")
+            present = Counter(canonical(row) for row in rows)
+            owned = Counter(canonical(row) for group in state["groups"].values() if group["text_status"] == "verified" for row in group["items"])
+            total = sum((Decimal(row["amount"]) for row in rows if row["amount"] is not None), Decimal(0))
+            summary_matches = not (owned - present) and len(rows) == observed["item_count"] and format(total, ".2f") == observed["daily_amount"]
+            if observed["status"] == "完成" and any(row["amount"] is None for row in rows):
+                summary_matches = False
+        else:
+            summary_matches = daily_fingerprint(rows) == operation["summary_basis"]
     if observed == operation["expected"]:
-        result = "verified"
+        result = "verified" if summary_matches and structure_matches else "uncertain"
         if operation["kind"] in {"text", "image"} and not data.get("locators"):
             raise ValueError("Verified group requires actual record IDs or row locators")
         if operation["kind"] in {"text", "image"}:
             group = state["groups"][operation["group_id"]]
-            locators = data["locators"]
-            if not isinstance(locators, list) or len(locators) != len(group["items"]) or len(set(locators)) != len(locators):
-                raise ValueError("One unique actual locator required for each purchase item")
-            if project.config["document_type"] == "smartsheet":
-                valid = all(isinstance(value, str) and value for value in locators)
-            else:
-                valid = all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in locators)
-            if not valid:
-                raise ValueError("Use record IDs for SmartSheet and zero-based row numbers for SHEET")
+            locators = TencentAdapter.locators(project.config["document_type"], data["locators"], len(group["items"]))
             if operation["kind"] == "image" and locators != group.get("locators"):
                 raise ValueError("Photo locators do not match the verified text mapping")
     elif observed == operation["before"] and data.get("absence_verified") is True:
         result = "not_applied"
     operation.update(status=result, observed=observed, evidence=data["evidence"], resolved_at=now())
+    if data.get("legacy_readback_reviewed") is True:
+        operation["legacy_readback_reviewed"] = True
+    operation.pop("conflict_reason", None)
+    if not summary_matches:
+        operation["conflict_reason"] = "Daily purchases changed while updating the summary"
+    elif not structure_matches:
+        operation["conflict_reason"] = "Target structure changed during the write"
     if result == "verified":
         kind = operation["kind"]
+        if writing:
+            state.setdefault("structures", {})[digest(operation["target"])] = data["structure"]
         if kind in {"text", "image"}:
             group = state["groups"][operation["group_id"]]
             group[kind + "_status"] = "verified"
             group[kind + "_snapshot"] = observed
             group["locators"] = data["locators"]
             group["target"] = operation["target"]
-            state["summary"] = {"status": "stale"}
+            if kind == "image":
+                group["image_sha256"] = operation.get("image_sha256") or group["physical_sha256"][:]
+            stale_summary(state)
         elif kind == "summary":
             state["summary"] = {"status": "verified", "data": observed, "target": operation["target"], "at": now()}
-    return {"operation_id": operation["operation_id"], "status": result}
+    return {"operation_id": operation["operation_id"], "status": result,
+            **({"error": operation["conflict_reason"]} if result == "uncertain" and "conflict_reason" in operation else {})}
 
 
 def adopt(project, state, data):
     if data.get("observed") != data.get("expected") or not data.get("evidence"):
         raise ValueError("Adoption requires current matching evidence; it never writes online")
     # Journal an observation and resolve in the same atomic local transaction.
-    payload = {**data, "before": {"observation_only": True}, "observation_only": True}
-    prepared = prepare(project, state, payload)
+    payload = {**data, "before": {"observation_only": True}}
+    prepared = prepare(project, state, payload, _adopting=True)
     return resolve(project, state, {**data, "operation_id": prepared["operation_id"]})
 
 
 def cache_image(project, state, data):
     sha = data.get("sha256")
     physical = {sha for group in state["groups"].values() for sha in group["physical_sha256"]}
-    if sha not in state["photos"] or sha not in physical or not data.get("image_id"):
+    if sha not in state["photos"] or sha not in physical or not isinstance(data.get("image_id"), str) or not data["image_id"]:
         raise ValueError("Upload must refer to an observed physical photo")
-    uploaded, expiry = (dt.datetime.fromisoformat(data[key]) for key in ("uploaded_at", "expires_at"))
-    if uploaded.tzinfo is None or expiry.tzinfo is None or expiry <= uploaded:
+    uploaded, expiry = (dt.datetime.fromisoformat(data[key].replace("Z", "+00:00")) for key in ("uploaded_at", "expires_at"))
+    if (uploaded.tzinfo is None or expiry.tzinfo is None or expiry <= uploaded or
+            expiry > uploaded + dt.timedelta(days=1) or uploaded > dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)):
         raise ValueError("Timezone-aware valid upload expiry required")
     state["uploads"][sha] = {key: data[key] for key in ("image_id", "uploaded_at", "expires_at")}
-    return {"sha256": sha, "status": "cached", "usable": expiry > dt.datetime.now(dt.timezone.utc)}
+    return image_cache_status(state, sha)
 
 
 def pending_photos(state):
@@ -478,7 +621,7 @@ def status(project, state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["scan", "identify", "prepare", "resolve", "adopt", "cache-image", "status"])
+    parser.add_argument("command", choices=["scan", "identify", "prepare", "resolve", "adopt", "cache-image", "image-cache", "adapt", "status"])
     parser.add_argument("--project", required=True, type=Path)
     parser.add_argument("--date", help="ISO date selected by the user; otherwise today in project timezone")
     parser.add_argument("--input", type=Path)
@@ -487,20 +630,40 @@ def main():
     project = Project(args.project, args.date)
     if args.command == "status":
         result = status(project, project.load())
+    elif args.command == "image-cache":
+        state = project.load()
+        physical = {sha for group in state["groups"].values() for sha in group["physical_sha256"]}
+        selected = sorted(physical)[:20]
+        if args.input:
+            selected = project.input(args.input).get("sha256")
+            if not isinstance(selected, list) or len(selected) > 20 or any(not isinstance(sha, str) or sha not in physical for sha in selected):
+                raise ValueError("Select at most 20 current physical hashes")
+        result = {"date": project.date, "images": [image_cache_status(state, sha) for sha in selected], "total": len(physical)}
     elif args.command == "scan":
         result = project.mutate(lambda state: scan(project, state, args.order_file))
     else:
         if not args.input:
             parser.error("--input is required for this command")
         data = project.input(args.input)
-        command = {"identify": identify, "prepare": prepare, "resolve": resolve, "adopt": adopt, "cache-image": cache_image}[args.command]
-        result = project.mutate(lambda state: command(project, state, data))
+        if args.command == "adapt":
+            sheet_type = project.config["document_type"]
+            if data.get("kind") == "merge":
+                result = {"payload": TencentAdapter.merge_range(sheet_type, data["rows"], data["column"],
+                          data["allowed_range"], data["current_merges"], data["cells_blank"])}
+            else:
+                result = {"payload": TencentAdapter.write_cell(sheet_type, data.get("value"), data["field_type"], project.config.get("timezone", "Asia/Shanghai"))}
+        else:
+            command = {"identify": identify, "prepare": prepare, "resolve": resolve, "adopt": adopt, "cache-image": cache_image}[args.command]
+            result = project.mutate(lambda state: command(project, state, data))
     print(json.dumps(result, ensure_ascii=False, allow_nan=False))
 
 
 if __name__ == "__main__":
     try:
         main()
+    except ConflictError as error:
+        print(json.dumps({"status": "conflict", "error": str(error)}, ensure_ascii=False))
+        sys.exit(2)
     except (ValueError, OSError, KeyError, TypeError, InvalidOperation) as error:
         print(json.dumps({"status": "blocked", "error": str(error)}, ensure_ascii=False))
         sys.exit(2)

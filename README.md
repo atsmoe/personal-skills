@@ -7,7 +7,7 @@
 | 技能 | 版本 | 用途 |
 |---|---|---|
 | [照片转采购明细](skills/photo-purchase-ledger/SKILL.md) | 2.5.0 | 有界摘要、采购组重定位、固定执行与失败接续；分别验收本地及腾讯在线采购表，保留历史与协作者增补。 |
-| [腾讯每日采购](skills/photo-purchase-tencent-daily/SKILL.md) | 1.0.0 | 单日腾讯 SHEET／SmartSheet 采购增量、失败接续与当天汇总。 |
+| [腾讯每日采购](skills/photo-purchase-tencent-daily/SKILL.md) | 1.1.0 | 单日腾讯 SHEET／SmartSheet 采购增量、写前冲突检查、图片缓存及当天汇总读回。 |
 | [剧组报销](skills/prepare-reimbursement-submission/SKILL.md) | 1.1.0 | 完整报销提交包及按需加载的铁路客票附件整理、工作簿核验；保护原件与候选输出。 |
 
 只阅读当前任务所需参考，不默认加载全部源码或重识别历史图片。脚本成功不等于在线同步、票面核实或 Excel 打开验收成功。
@@ -43,7 +43,7 @@ PyMuPDF 的固定版本用于可重现验证，不表示永远无需安全更新
 
 图片创建时间迁移可能丢失；Linux ctime 不能当创建时间。迁移前导出原设备顺序清单，新设备用哈希校验后恢复，步骤见 [项目与设备适配](skills/photo-purchase-ledger/references/project-settings.md)。字体缺失或软件兼容性差异按当前模板处理，不保证所有设备的显示完全相同。
 
-本次自动检查在 Windows / Python 3.12 运行，包含换目录、中文路径和搬移技能后的调用；尚未在实际 Linux/macOS 设备或其表格软件验收。
+综合采购与报销技能此前在 Windows / Python 3.12 自动检查，包含换目录、中文路径和搬移技能后的调用。腾讯每日采购1.1.0在 Linux / Python 3.14 验证本地逻辑，目前本地状态锁使用 POSIX fcntl；未验收 Windows 运行及真实腾讯写入。
 
 ## 安全与验证
 
@@ -55,6 +55,7 @@ PyMuPDF 的固定版本用于可重现验证，不表示永远无需安全更新
 
 ```text
 python -m unittest discover -s <仓库路径>/tests -v
+python -m unittest discover -s <仓库路径>/skills/photo-purchase-tencent-daily/scripts -p test_daily.py -v
 ```
 
 仓库只收录通用技能、代码、测试与文档，不存采购图、业务表、识别结果、token 或个人日志。项目配置保存在各项目并被忽略；模板示例不含真实业务条目。普通更新不改写 Git 历史，旧公开提交里的旧说明仍可能存在。
