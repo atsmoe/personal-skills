@@ -10,6 +10,7 @@ from bounded_xlsx import file_hash
 from ledger_io import read_json, write_new_json
 from ledger_model import WorkbookView, decimal, inspect_ledger, normal, column_number, digest
 from ledger_state import check_inputs, locked_run, save, atomic_json
+from ledger_preservation import historical_layout_errors, shift_formula
 
 
 def apply_local(run_dir):
@@ -96,12 +97,33 @@ def verify_candidate(state, path, online_assets=None):
     errors.extend('Formula error: ' + str(e) for e in after.formula_errors)
     errors.extend('Missing formula cache: ' + str(e) for e in after.missing_caches)
     mutable = {(f['row'], f['column']) for f in plan['formulas']}
+    extra_merges = []
+    columns = config['columns']
+    for entry in plan['rows']:
+        if entry['role'] != 'detail':
+            extra_merges.append((entry['row'], column_number(columns['label']), entry['row'], column_number(columns['amount'])-1))
+    extra_pictures = []
+    for group in plan['groups']:
+        for photo in group['photos']:
+            col = column_number(columns['photo'])
+            wanted = (online_assets or {}).get((photo['start_row'], photo['sha256']), photo['sha256'])
+            extra_pictures.append((photo['start_row'], col, wanted))
+            if photo['end_row'] > photo['start_row']:
+                extra_merges.append((photo['start_row'], col, photo['end_row'], col))
+    errors.extend(historical_layout_errors(before, after, plan['insert_before'], plan['insert_count'], extra_merges, extra_pictures))
     for old, new in plan['historical_row_map'].items():
         old = int(old)
-        for col, cell in before.rows[old].items():
+        for col in before.rows[old].keys() | after.rows.get(new, {}).keys():
+            cell = before.rows[old].get(col, {})
             if (new, col) in mutable:
                 continue
             current = after.rows.get(new, {}).get(col, {})
+            expected_formula = shift_formula(cell.get('formula'), plan['insert_before'], plan['insert_count'])
+            actual_formula = shift_formula(current.get('formula'), 1, 0)
+            if expected_formula != actual_formula:
+                errors.append(f'Historical formula changed: {col}{old} -> {col}{new}')
+            if expected_formula:
+                continue
             same=cell.get('value') == current.get('value')
             if not same and cell.get('type')=='n' and current.get('type')=='n':
                 try:
@@ -110,18 +132,10 @@ def verify_candidate(state, path, online_assets=None):
                     pass
             if not same:
                 errors.append(f'Historical value changed: {col}{old} -> {col}{new}')
-            # Compare formula semantics relative to its row. Absolute references are conservative.
-        if old in before.detail_rows():
-            if before.fingerprints([old])[0] != after.fingerprints([new])[0]:
-                errors.append(f'Historical purchase/formula changed at row {old}')
-        old_photo = sorted(p['sha256'] for p in before.pictures if p['row'] == old)
-        new_photo = sorted(p['sha256'] for p in after.pictures if p['row'] == new)
-        if old_photo != new_photo:
-            errors.append(f'Historical photo changed at row {old}')
-        if before.cell_styles.get(old, {}) != after.cell_styles.get(new, {}):
-            errors.append(f'Historical style changed at row {old}')
-        if decimal(before.row_dimensions.get(old, {}).get('ht', before.default_height)) != decimal(after.row_dimensions.get(new, {}).get('ht', after.default_height)):
-            errors.append(f'Historical row height changed at row {old}')
+    for formula in plan['formulas']:
+        actual = after.rows.get(formula['row'], {}).get(formula['column'], {}).get('formula')
+        if shift_formula(actual, 1, 0) != shift_formula(formula['formula'], 1, 0):
+            errors.append(f'Planned summary formula differs: {formula["column"]}{formula["row"]}')
     for entry in plan['rows']:
         row = entry['row']
         for field, value in entry['values'].items():
@@ -154,6 +168,8 @@ def verify_local(run_dir):
         local = state['local']
         if local['status'] not in ('applied', 'verified', 'accepted'):
             raise ValueError('Apply and recalculate the candidate before verifying')
+        local['status'] = 'verifying'
+        save(directory, state, 'local_verifying')
         if file_hash(local['candidate']) != local['sha256']:
             raise ValueError('Candidate changed after Excel read-back')
         proof = read_json(local['editor_result'])
@@ -163,6 +179,7 @@ def verify_local(run_dir):
         report = verify_candidate(state, local['candidate'])
         atomic_json(directory / 'local-check.json', report)
         if report['errors']:
+            local['status'] = 'failed'
             save(directory, state, 'local_check_failed')
             raise ValueError(f"{len(report['errors'])} checks failed; see {directory / 'local-check.json'}")
         local['status'] = 'verified'
@@ -174,21 +191,36 @@ def publish_local(run_dir):
     with locked_run(run_dir) as (directory, state):
         local = state['local']
         source = Path(state['inputs']['workbook']['path'])
+        backup = directory / 'original.xlsx'
+        def confirmed_publish():
+            local.update(status='published', backup=str(backup))
+            save(directory, state, 'complete')
+            pointer = read_json(directory / 'success.json')
+            pointer['published'] = True
+            atomic_json(directory / 'success.json', pointer)
+            return state
         if local['status'] == 'published':
             if file_hash(source) != local['sha256']:
                 raise ValueError('Published file changed; refresh before further work')
-            return state
+            return confirmed_publish()
+        intent = state.get('publish_intent', {})
+        if intent.get('after') == local.get('sha256') and file_hash(source) == local['sha256']:
+            check_inputs(state, workbook=False)
+            if not backup.exists() or file_hash(backup) != state['inputs']['workbook']['sha256']:
+                raise ValueError('Interrupted publish lacks the exact original backup')
+            return confirmed_publish()
         check_inputs(state)
         if state['stage'] != 'complete' or local['status'] != 'accepted':
             raise ValueError('Finish all required acceptance before publishing')
         if file_hash(local['candidate']) != local['sha256']:
             raise ValueError('Candidate changed after acceptance')
-        backup = directory / 'original.xlsx'
         if not backup.exists():
             with source.open('rb') as src, backup.open('xb') as dst:
                 shutil.copyfileobj(src, dst)
         if file_hash(backup) != state['inputs']['workbook']['sha256']:
             raise ValueError('Backup does not match the original input')
+        state['publish_intent'] = {'before': state['inputs']['workbook']['sha256'], 'after': local['sha256']}
+        save(directory, state, 'complete')
         # Atomic replace on the same filesystem; Excel locks cause a recoverable failure.
         import tempfile
         temporary = None
@@ -206,12 +238,7 @@ def publish_local(run_dir):
                 os.unlink(temporary)
         if file_hash(source) != local['sha256']:
             raise ValueError('Published file read-back failed')
-        local.update(status='published', backup=str(backup))
-        save(directory, state, 'complete')
-        pointer = read_json(directory / 'success.json')
-        pointer['published'] = True
-        atomic_json(directory / 'success.json', pointer)
-        return state
+        return confirmed_publish()
 
 
 def accept_visual(run_dir, evidence_path, target='local'):
@@ -247,6 +274,15 @@ def finish(run_dir):
                 continue
             if file_hash(target.get('candidate', target.get('export'))) != target['sha256'] or file_hash(target['visual_evidence']) != target['visual_sha256']:
                 raise ValueError('Acceptance evidence changed; success baseline unchanged')
+            evidence = read_json(target['visual_evidence'])
+            if file_hash(evidence['artifact']) != evidence['artifact_sha256']:
+                raise ValueError('Visual preview artifact changed; success baseline unchanged')
+            if name == 'online':
+                import datetime as dt
+                receipt = read_json(target['receipt'])
+                when = dt.datetime.fromisoformat(receipt['completed_at'])
+                if file_hash(target['receipt']) != target.get('receipt_sha256') or receipt.get('sha256') != target['sha256'] or not when.tzinfo or not 0 <= (dt.datetime.now(dt.timezone.utc)-when).total_seconds() <= 300:
+                    raise ValueError('Refresh online export and acceptance before finishing; latest receipt must be within five minutes')
         report = inspect_ledger(state['local']['candidate'], state['inputs']['recognition']['path'],
                                 state['source_root'], state['inputs']['config']['path'], source_id=state['plan']['target_id'])
         report.update(acceptance_verified=True, observation_only=False)

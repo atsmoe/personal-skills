@@ -1,7 +1,7 @@
 ---
 name: photo-purchase-ledger
 metadata:
-  version: '2.4.0'
+  version: '2.5.0'
 description: 按日期识别采购收据与实物照，增量更新月度采购 Excel、核对本地图片是否入表，并同步或统一本地及腾讯在线采购表格式。适用于“整理1001”“继续1002”“识图填采购表”“对照图片核对采购表”等请求。
 ---
 
@@ -29,7 +29,7 @@ description: 按日期识别采购收据与实物照，增量更新月度采购 
 
 | 本次任务 | 资料与范围 |
 |---|---|
-| 新增一天、继续同一天 | [incremental.md](references/incremental.md)，写表再读 [workbook.md](references/workbook.md)；只识别新增、变更、未核实来源 |
+| 新增一天、继续同一天、失败接续 | [execution.md](references/execution.md)；用固定入口，异常再读 [incremental.md](references/incremental.md) 或 [workbook.md](references/workbook.md)；只识别新增、变更、未核实来源 |
 | 对照照片核对 | [reconciliation.md](references/reconciliation.md) 和增量参考；核对覆盖，差异报告不自动改账 |
 | 统一或修复格式 | workbook 参考；检查全表格式，修改授权区域，预览受影响区域 |
 | 在线同步或回写本地 | [online-workbook.md](references/online-workbook.md)；取最新在线状态，按差异操作 |
@@ -40,11 +40,14 @@ description: 按日期识别采购收据与实物照，增量更新月度采购 
 2. 新增或变化来源必须看原图；旧记录只有已看图核实、哈希一致且表内映射未变时才复用。旧 OCR/JSON 或“文件未变”本身不证明识别正确。
 3. 写前刷新在线状态、重定位并复查缺项。只补授权缺项、必要汇总引用或授权格式，不用旧表覆盖在线。新增格带真实边框；多条明细共用实物照时合并实际照片列的对应区域。
 4. 程序核验历史值/公式/图片保留、金额及配置的统一格式，预览新增区域与末尾。保存后正常打开确认无需修复；在线另做样式、合并及结果读回。通过后才记录来源已核实/已入表，未完成检查明确保留。
+5. 验收通过后保存 `context_after.json` 和按目标区分的 `success.json`。中断保留阶段与现场，先核实哪些操作已生效；不在半成品上重复插行、插图，不把未验收结果推进为成功基线。
 
 ## 工具与验收边界
 
+- [ledger_run.py](scripts/ledger_run.py)：inspect／prepare／apply-local／verify-local／online-plan／verify-online／accept-visual／finish／publish-local／status，支持状态记录、采购组重定位和接续。依赖与固定流程见 execution；准备、写入、验收和正式发布是不同阶段。
 - [ledger_context.py](scripts/ledger_context.py)：只读 XLSX/指定日期照片，输出观察快照和有限摘要；用参数适配工作表、列映射、表头及迁移顺序。它不计算公式、不做 OCR、不证明在线最新。
 - [inventory.py](scripts/inventory.py)：流式哈希与原始创建顺序；只允许新辅助 JSON，不覆盖现有文件或原图。
 - [check_xlsx.py](scripts/check_xlsx.py)：缓存金额、错误和可选图片几何；留白及默认字体数字宽度可配置，不证明字体/在线验收通过。
 - 三个入口依赖 Python 标准库，无网络调用；ZIP/XML 和图片扫描有资源上限，详见项目设置参考。它们只读业务源文件，但会按参数写辅助 JSON。
+- 所有常规摘要默认不超过 2,000 字符，硬上限 5,000；完整错误落盘，失败不因省略展示而变成通过。在线全量导出、图片 base64 和完整日志在宿主处理，不进入模型。未实际测得的 token／费用不填零，不宣称固定节省比例。
 - XML 修改保留兼容命名空间、关系、公式及原始图片对象；可解析不等于 Excel 能正常打开。文件占用时保留候选结果，不强关用户应用。

@@ -36,7 +36,7 @@ class PortabilitySecurityTests(unittest.TestCase):
         self.cwd.mkdir()
 
     def run_cli(self, script, *args):
-        return subprocess.run([sys.executable, str(script), *map(str, args)], cwd=self.cwd,
+        return subprocess.run([sys.executable, '-X', 'utf8', str(script), *map(str, args)], cwd=self.cwd,
                               capture_output=True, text=True, encoding='utf-8')
 
     def image_manifest(self):

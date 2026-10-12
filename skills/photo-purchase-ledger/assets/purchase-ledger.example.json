@@ -5,6 +5,11 @@
   "sheet": null,
   "authoritative_source": "confirm",
   "online_url": null,
+  "online_target": {
+    "provider": "tencent_docs",
+    "file_id": null,
+    "sheet_id": null
+  },
   "header_row": 2,
   "columns": {
     "label": "A",
@@ -23,7 +28,10 @@
     "body_size_pt": null,
     "title_size_pt": null,
     "detail_height_pt": null,
+    "summary_height_pt": null,
     "online_detail_height_px": null,
+    "online_summary_height_px": null,
+    "online_photo_width_px": null,
     "padding_x_px": 14,
     "padding_y_px": 8,
     "digit_width_px": 7

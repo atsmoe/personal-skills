@@ -13,11 +13,11 @@ SCRIPTS = ROOT / 'skills/photo-purchase-ledger/scripts'
 NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 
 
-def workbook(path, rows):
+def workbook(path, rows, layout=''):
     with zipfile.ZipFile(path, 'w') as z:
         z.writestr('xl/workbook.xml', f'<workbook xmlns="{NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Test" sheetId="1" r:id="r1"/></sheets></workbook>')
         z.writestr('xl/_rels/workbook.xml.rels', '<Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/></Relationships>')
-        z.writestr('xl/worksheets/sheet1.xml', f'<worksheet xmlns="{NS}"><sheetData>{rows}</sheetData></worksheet>')
+        z.writestr('xl/worksheets/sheet1.xml', f'<worksheet xmlns="{NS}"><sheetData>{rows}</sheetData>{layout}</worksheet>')
 
 
 class LedgerWorkflowTests(unittest.TestCase):
@@ -121,6 +121,9 @@ class LedgerWorkflowTests(unittest.TestCase):
         result = self.cli('ledger_run.py', 'inspect', '--workbook', before, '--recognition', rec,
                           '--source-root', self.root, '--config', config, '--output', first)
         self.assertEqual(result.returncode, 0, result.stderr)
+        approved = json.loads(first.read_text(encoding='utf-8'))
+        approved.update(acceptance_verified=True, observation_only=False)
+        first.write_text(json.dumps(approved), encoding='utf-8')
         result = self.cli('ledger_run.py', 'inspect', '--workbook', after, '--recognition', rec,
                           '--source-root', self.root, '--config', config, '--baseline', first, '--output', second)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -197,6 +200,89 @@ class LedgerWorkflowTests(unittest.TestCase):
                         '--source-root',self.root,'--config',self.config(),'--run-dir',self.root/'run')
         self.assertEqual(result.returncode,1)
         self.assertIn('binding',result.stdout)
+
+    def test_observation_baseline_cannot_bypass_the_source_binding_gate(self):
+        path, baseline = self.root/'existing.xlsx', self.root/'observed.json'
+        workbook(path,self.purchase_row(3))
+        rec,config=self.recognition(),self.config()
+        self.assertEqual(self.cli('ledger_run.py','inspect','--workbook',path,'--recognition',rec,
+            '--source-root',self.root,'--config',config,'--output',baseline).returncode,0)
+        result=self.cli('ledger_run.py','prepare','--workbook',path,'--recognition',rec,
+            '--source-root',self.root,'--config',config,'--baseline',baseline,'--run-dir',self.root/'run')
+        self.assertEqual(result.returncode,1)
+        self.assertIn('binding',result.stdout)
+
+    def test_preservation_covers_old_and_new_formulas_merges_and_column_widths(self):
+        sys.path.insert(0,str(SCRIPTS))
+        from ledger_local import verify_candidate
+        from ledger_model import config_from
+        before,after=self.root/'before.xlsx',self.root/'after.xlsx'
+        rows=self.purchase_row(3)+'<row r="4"><c r="H4"><f>SUM(H3)</f><v>12</v></c></row>'
+        layout='<cols><col min="10" max="10" width="40"/></cols><mergeCells><mergeCell ref="A4:G4"/></mergeCells>'
+        workbook(before,rows,layout)
+        plan={'config':config_from(self.config()),'insert_before':5,'insert_count':0,'historical_row_map':{'3':3,'4':4},
+              'rows':[],'groups':[],'date':'2026-06-01','formulas':[],'subtotal_row':4,'total_row':4,
+              'expected_day_amount':'12','expected_total_amount':'12'}
+        state={'plan':plan,'inputs':{'workbook':{'path':str(before)}}}
+        for change in ('unchanged','merge','width','old_formula','new_formula'):
+            with self.subTest(change=change):
+                actual_rows,actual_layout=rows,layout
+                plan['formulas']=[]
+                if change=='merge':actual_layout=layout.replace('<mergeCell ref="A4:G4"/>','')
+                if change=='width':actual_layout=layout.replace('width="40"','width="2"')
+                if change=='old_formula':actual_rows=rows.replace('SUM(H3)','12')
+                if change=='new_formula':
+                    plan['formulas']=[{'row':4,'column':'H','formula':'=SUM(H3)'}]
+                    actual_rows=rows.replace('<f>SUM(H3)</f>','')
+                workbook(after,actual_rows,actual_layout)
+                report=verify_candidate(state,after)
+                self.assertEqual(report['status'],'passed' if change=='unchanged' else 'failed',report)
+
+    def test_insert_adjusts_absolute_references_but_not_quoted_text(self):
+        sys.path.insert(0,str(SCRIPTS))
+        from ledger_preservation import shift_formula
+        self.assertEqual(shift_formula('=IF(A5="H9",SUM($H$5:H9),LOG10(10))',5,2),
+                         'IF(A7="H9",SUM($H$7:H11),LOG10(10))')
+        with self.assertRaises(ValueError):shift_formula('=SUM(Other!H5:H9)',5,2)
+
+    def test_changed_date_cannot_reuse_another_purchase_binding(self):
+        sys.path.insert(0,str(SCRIPTS))
+        from ledger_model import inspect_ledger
+        path=self.root/'dates.xlsx'
+        workbook(path,self.purchase_row(3)+self.purchase_row(9).replace('2026-06-01','2026-06-02'))
+        rec,config=self.recognition(),self.config()
+        report=inspect_ledger(path,rec,self.root,config)
+        report.update(acceptance_verified=True,observation_only=False)
+        baseline=self.root/'accepted.json';baseline.write_text(json.dumps(report),encoding='utf-8')
+        record=json.loads(rec.read_text());record['groups'][0]['date']='2026-06-02';rec.write_text(json.dumps(record))
+        self.assertEqual(inspect_ledger(path,rec,self.root,config,baseline)['groups'][0]['action'],'verify_binding')
+
+    def test_writer_claim_excludes_other_callers_and_recovers_a_completed_merge(self):
+        import datetime as dt
+        sys.path.insert(0,str(SCRIPTS))
+        from ledger_jobs import prepare
+        from ledger_model import digest
+        before,after=self.root/'empty.xlsx',self.root/'merged.xlsx'
+        workbook(before,'');workbook(after,'','<mergeCells><mergeCell ref="A4:G4"/></mergeCells>')
+        run=self.root/'run'
+        state=prepare(before,self.recognition(),self.root,self.config(),run)
+        plan={'target':{'file_id':'test'},'operations':[{'tool':'sheet_merge_cell','args':{'start_row':3,'end_row':3,'start_col':0,'end_col':6}}]}
+        state['online']={'status':'pending','operations_hash':digest(plan)}
+        (run/'run.json').write_text(json.dumps(state),encoding='utf-8')
+        (run/'online-plan.json').write_text(json.dumps(plan),encoding='utf-8')
+        (run/'online-checkpoint.json').write_text(json.dumps({'plan_hash':state['plan_hash'],'cursor':0,'in_flight':0}),encoding='utf-8')
+        after.with_suffix('.receipt.json').write_text(json.dumps({'file_id':'test','sha256':hashlib.sha256(after.read_bytes()).hexdigest(),'completed_at':dt.datetime.now(dt.timezone.utc).isoformat()}),encoding='utf-8')
+        def bridge(op,request):
+            return subprocess.run([sys.executable,'-X','utf8','-B',str(SCRIPTS/'ledger_bridge.py'),op,'--run-dir',str(run)],
+                input=json.dumps(request),capture_output=True,text=True,encoding='utf-8')
+        claim=bridge('claim',{});self.assertEqual(claim.returncode,0,claim.stdout)
+        token=json.loads(claim.stdout)['token']
+        self.assertEqual(bridge('claim',{}).returncode,1)
+        self.assertEqual(bridge('refresh',{'export':str(after)}).returncode,1)
+        recovered=bridge('refresh',{'writer_token':token,'export':str(after)})
+        self.assertEqual(recovered.returncode,0,recovered.stdout)
+        self.assertEqual(json.loads(recovered.stdout)['checkpoint']['cursor'],1)
+        self.assertEqual(bridge('release',{'writer_token':token}).returncode,0)
 
     def test_unresolved_field_and_changed_original_block_writes(self):
         for change in ('unresolved','source_changed','order_missing','amount_conflict'):

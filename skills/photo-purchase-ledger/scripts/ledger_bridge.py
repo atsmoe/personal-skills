@@ -8,6 +8,7 @@ import base64
 import datetime as dt
 import json
 import sys
+import secrets
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -53,7 +54,7 @@ def main():
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stdin.reconfigure(encoding='utf-8')
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation',choices=('read','checkpoint','readback','image','refresh','download'))
+    parser.add_argument('operation',choices=('read','claim','release','checkpoint','readback','image','refresh','download'))
     parser.add_argument('--run-dir',type=Path)
     args=parser.parse_args()
     request=json.load(sys.stdin)
@@ -65,8 +66,23 @@ def main():
             plan=read_json(directory/'online-plan.json')
             if digest(plan)!=state['online'].get('operations_hash'):
                 raise ValueError('Online operation plan changed after preparation')
+            if args.operation not in ('read','claim'):
+                token = request.pop('writer_token', None)
+                owner = state.get('online_writer')
+                if not owner or token != owner['token']:
+                    raise ValueError('This caller does not own the online writer; no checkpoint or recovery is allowed')
             if args.operation=='read':
                 result={'plan':plan,'checkpoint':read_json(directory/'online-checkpoint.json')}
+            elif args.operation=='claim':
+                if state.get('online_writer'):
+                    raise ValueError('Another invocation owns the entire online write; confirm it exited before explicit recovery')
+                result={'token':secrets.token_hex(24),'claimed_at':dt.datetime.now(dt.timezone.utc).isoformat()}
+                state['online_writer']=result
+                atomic_json(directory/'run.json',state)
+            elif args.operation=='release':
+                state.pop('online_writer')
+                atomic_json(directory/'run.json',state)
+                result={'released':True}
             elif args.operation=='checkpoint':
                 old=read_json(directory/'online-checkpoint.json')
                 if request['plan_hash']!=state['plan_hash'] or request['cursor'] not in (old['cursor'],old['cursor']+1):
@@ -102,7 +118,7 @@ def main():
                 cursor=checkpoint['cursor']
                 if checkpoint['in_flight'] is not None:
                     operation=plan['operations'][cursor]['tool']
-                    if operation in ('sheet_insert_dimension','sheet_set_range_value','sheet_insert_image'):
+                    if operation in ('sheet_insert_dimension','sheet_set_range_value','sheet_insert_image','sheet_merge_cell'):
                         try:
                             verify_partial(state,request['export'],plan['operations'],cursor+1)
                             checkpoint.update(cursor=cursor+1,in_flight=None)

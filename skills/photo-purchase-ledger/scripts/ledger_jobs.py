@@ -9,6 +9,7 @@ from bounded_xlsx import file_hash
 from ledger_io import read_json, write_new_json
 from ledger_model import (FIELDS, WorkbookView, config_from, decimal, digest,
                           inspect_ledger, recognition_from)
+from ledger_preservation import shift_formula
 
 
 def sum_formula(column, rows):
@@ -82,6 +83,9 @@ def prepare(workbook, recognition, source_root, config_path, run_dir, baseline=N
     insert_before = day_totals[0] if day_totals else total_rows[0] if total_rows else max([config['header_row'], *view.rows]) + 1
     if insert_before + row_count > 1048576:
         raise ValueError('Append exceeds worksheet row limit')
+    for cells in view.rows.values():
+        for cell in cells.values():
+            shift_formula(cell.get('formula'), insert_before, row_count)
     shift = lambda row: row + row_count if row >= insert_before else row
     current = insert_before
     groups, new_rows = [], []

@@ -183,6 +183,8 @@ class WorkbookView:
         with BoundedXlsx(path) as z:
             styles = self._styles(z)
             book = ET.fromstring(z.read('xl/workbook.xml'))
+            book_properties = book.find('s:workbookPr', NS)
+            self.date_epoch = dt.date(1904, 1, 1) if book_properties is not None and book_properties.get('date1904') in ('1', 'true') else dt.date(1899, 12, 30)
             sheet = next(s for s in book.findall('s:sheets/s:sheet', NS) if s.get('name') == config['sheet'])
             rels = {r.get('Id'): r.get('Target') for r in ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))}
             target = rels[sheet.get('{' + NS['r'] + '}id')]
@@ -306,11 +308,13 @@ class WorkbookView:
             for anchor in ET.fromstring(z.read(part)):
                 start = anchor.find('x:from', x)
                 blip = anchor.find('.//a:blip', x)
-                if start is None or blip is None:
+                if blip is not None and start is None:
+                    raise ValueError('Absolute photo anchors require a dedicated preservation adapter')
+                if blip is None:
                     continue
                 target = images.get(blip.get('{' + NS['r'] + '}embed'))
                 if not target:
-                    continue
+                    raise ValueError('External or missing photo data cannot be verified')
                 media = target.lstrip('/') if target.startswith('/') else posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
                 row = int(start.find('x:row', x).text) + 1
                 col = int(start.find('x:col', x).text) + 1
@@ -341,7 +345,7 @@ class WorkbookView:
             return None
         text = str(value).strip()
         if re.fullmatch(r'\d+(?:\.\d+)?', text):
-            return (dt.date(1899, 12, 30) + dt.timedelta(days=int(Decimal(text)))).isoformat()
+            return (self.date_epoch + dt.timedelta(days=int(Decimal(text)))).isoformat()
         match = re.fullmatch(r'(?:(\d{4})[-/年])?(\d{1,2})[-/月](\d{1,2})日?', text)
         if match:
             return dt.date(int(match[1] or year), int(match[2]), int(match[3])).isoformat()
@@ -418,7 +422,8 @@ def inspect_ledger(workbook, recognition, source_root, config_path, baseline=Non
         prior = previous.get(group['id'], {})
         result.update(rows=rows, content_fingerprint=content, photo_fingerprint=photos,
                       layout_fingerprint=layout, action='verify_binding')
-        if prior.get('content_fingerprint') == content and prior.get('source_fingerprint') == result['source_fingerprint']:
+        trusted = old.get('acceptance_verified') is True and old.get('observation_only') is False
+        if trusted and prior.get('date') == group['date'] and prior.get('content_fingerprint') == content and prior.get('source_fingerprint') == result['source_fingerprint']:
             result['moved'] = rows != prior.get('rows')
             if prior.get('photo_fingerprint') != photos:
                 result.update(action='review_photos', needs_recognition=True)

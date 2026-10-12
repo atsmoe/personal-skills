@@ -9,6 +9,7 @@ from ledger_model import WorkbookView, column_number, decimal, digest
 from ledger_state import locked_run, check_inputs, save, atomic_json
 from ledger_local import verify_candidate
 from ledger_photo import framed_photo
+from ledger_preservation import historical_layout_errors, shift_formula
 
 
 def snapshot_identity(path, config):
@@ -38,7 +39,7 @@ def verify_partial(state, export, operations, cursor):
             changed={}
             for (row,col),value in expected.items():
                 if isinstance(value,str) and value.startswith('='):
-                    value=re.sub(r'(\$?[A-Z]{1,3}\$?)([1-9][0-9]*)',lambda m:m[1]+str(int(m[2])+count if int(m[2])>start else int(m[2])),value)
+                    value='='+shift_formula(value,start+1,count)
                 changed[(row+count if row>=start else row,col)]=value
             expected=changed
             images=[(row+count if row>=start else row,col,sha) for row,col,sha in images]
@@ -63,10 +64,13 @@ def verify_partial(state, export, operations, cursor):
     if sorted(images)!=sorted((p['row']-1,p['col']-1,p['sha256']) for p in after.pictures):
         raise ValueError('Online picture state is not the completed operation state')
     inserted=any(op['tool']=='sheet_insert_dimension' for op in operations[:cursor])
-    for old in before.rows:
-        new=state['plan']['historical_row_map'][str(old)] if inserted else old
-        if before.cell_styles.get(old,{})!=after.cell_styles.get(new,{}):
-            raise ValueError('Historical online formatting changed; review before resuming')
+    merges = [(op['args']['start_row']+1,op['args']['start_col']+1,op['args']['end_row']+1,op['args']['end_col']+1)
+              for op in operations[:cursor] if op['tool']=='sheet_merge_cell']
+    photos = [(op['args']['row_index']+1,op['args']['col_index']+1,op['image']['sha256'])
+              for op in operations[:cursor] if op['tool']=='sheet_insert_image']
+    errors = historical_layout_errors(before,after,state['plan']['insert_before'],state['plan']['insert_count'] if inserted else 0,merges,photos)
+    if errors:
+        raise ValueError('Historical online formatting changed; review before resuming: '+errors[0])
     return True
 
 
@@ -115,6 +119,8 @@ def online_plan(run_dir):
             changed={}
             for key,value in grid.items():
                 row,col=map(int,key.split(','))
+                if isinstance(value,str) and value.startswith('='):
+                    value='='+shift_formula(value,start+1,plan['insert_count'])
                 changed[f'{row+plan["insert_count"] if row>=start else row},{col}']=value
             grid.clear();grid.update(changed)
         if plan['insert_count']:
@@ -187,6 +193,8 @@ def online_plan(run_dir):
 def verify_online(run_dir, export, receipt):
     with locked_run(run_dir) as (directory,state):
         check_inputs(state)
+        state['online']['status']='verifying'
+        save(directory,state,'online_verifying')
         target=state['plan']['config'].get('online_target',{})
         proof=read_json(receipt)
         if proof.get('file_id')!=target.get('file_id') or proof.get('sha256')!=file_hash(export):
@@ -197,12 +205,17 @@ def verify_online(run_dir, export, receipt):
         operations=read_json(directory/'online-plan.json')
         if digest(operations)!=state['online']['operations_hash']:
             raise ValueError('Online plan changed after preparation')
+        checkpoint=read_json(directory/'online-checkpoint.json')
+        if checkpoint.get('plan_hash')!=state['plan_hash'] or checkpoint.get('cursor')!=len(operations['operations']) or checkpoint.get('in_flight') is not None:
+            raise ValueError('All online operations must be reconciled before verification')
         assets={(op['args']['row_index']+1,op['image']['source_sha256']):op['image']['sha256']
                 for op in operations['operations'] if op['tool']=='sheet_insert_image'}
         report=verify_candidate(state,export,online_assets=assets)
         atomic_json(directory/'online-check.json',report)
         if report['errors']:
+            state['online']['status']='failed'
+            save(directory,state,'online_check_failed')
             raise ValueError(f'{len(report["errors"])} online checks failed; inspect the private full report')
-        state['online'].update(status='verified',export=str(Path(export).resolve()),sha256=file_hash(export),receipt=str(Path(receipt).resolve()))
+        state['online'].update(status='verified',export=str(Path(export).resolve()),sha256=file_hash(export),receipt=str(Path(receipt).resolve()),receipt_sha256=file_hash(receipt))
         save(directory,state,'online_verified')
         return state

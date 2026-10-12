@@ -22,6 +22,8 @@ def framed_photo(source, destination, width, height, padding_x=14, padding_y=8):
     # Three display pixels per pixel keep the preview clear without sending a
     # full camera-sized layout image to a cell that is only a few hundred px wide.
     scale=3
+    if round(width*scale)*round(height*scale)>40_000_000:
+        raise ValueError('Photo presentation frame exceeds 40 million pixels')
     with Image.open(source) as image:
         if image.width*image.height>40_000_000:
             raise ValueError('Photo exceeds 40 million pixels')

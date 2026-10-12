@@ -41,9 +41,13 @@ function verifyCells(actual, expected, range) {
   }
 }
 
-async function applyOperations({call, plan, checkpoint, saveCheckpoint, loadImage, refresh, saveReadback}) {
+async function applyOperations({call, plan, checkpoint, saveCheckpoint, loadImage, refresh, saveReadback, acquireWriter, releaseWriter}) {
   if (!plan.target.file_id || !plan.target.sheet_id || !plan.plan_hash) throw new Error('Explicit target and plan required');
   if (checkpoint.plan_hash !== plan.plan_hash) throw new Error('Checkpoint belongs to another plan');
+  if (typeof acquireWriter !== 'function' || typeof releaseWriter !== 'function') throw new Error('An exclusive writer owner is required for the entire online operation');
+  const writer = await acquireWriter();
+  if (!writer) throw new Error('Exclusive writer acquisition failed');
+  try {
   // A callback must re-export and compare the entire current workbook, including
   // collaborator changes. A timestamp or total alone is insufficient.
   const refreshed = await refresh(checkpoint.cursor,checkpoint.in_flight);
@@ -68,6 +72,9 @@ async function applyOperations({call, plan, checkpoint, saveCheckpoint, loadImag
     await saveCheckpoint(checkpoint);
   }
   return {status:'submitted',operations:checkpoint.cursor,acceptance_verified:false};
+  } finally {
+    await releaseWriter(writer);
+  }
 }
 
 async function loadImageParts(readPart, image) {

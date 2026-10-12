@@ -81,8 +81,11 @@ try {
         }
         foreach ($formula in $plan.formulas) {
             $cell = $sheet.Range("$($formula.column)$($formula.row)")
-            $cell.NumberFormat = '0.00'
+            $existingNumberFormat = $cell.NumberFormatLocal
+            $isNewSummary = @($plan.rows | Where-Object { $_.row -eq $formula.row }).Count -gt 0
             $cell.Formula = [string]$formula.formula
+            if ($isNewSummary) { $cell.NumberFormat = '0.00' }
+            else { $cell.NumberFormatLocal = $existingNumberFormat }
         }
         foreach ($group in $plan.groups) {
             foreach ($photo in $group.photos) {
