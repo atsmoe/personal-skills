@@ -1,0 +1,4 @@
+interface:
+  display_name: "腾讯每日采购"
+  short_description: "只处理指定一天的采购照片，增量写入腾讯表格并安全接续和更新当天汇总"
+  default_prompt: "使用 $photo-purchase-tencent-daily 整理本项目指定日期的采购到腾讯文档。"

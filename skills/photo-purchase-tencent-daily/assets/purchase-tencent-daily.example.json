@@ -1,0 +1,23 @@
+{
+  "schema": "purchase-tencent-daily/v1",
+  "timezone": "Asia/Shanghai",
+  "document_type": "smartsheet",
+  "photos_directory": "photos/{date}",
+  "work_directory": ".work/tencent-daily",
+  "monthly_documents": {
+    "2026-10": {
+      "file_id": "REPLACE_WITH_CONFIRMED_FILE_ID",
+      "daily_sheet_format": "MMDD",
+      "summary_sheet": "月度汇总",
+      "summary_locators": {}
+    }
+  },
+  "daily_fields": {
+    "photo": "照片", "name": "名称", "spec": "规格", "quantity": "数量",
+    "unit": "单位", "unit_price": "单价", "amount": "金额", "note": "备注"
+  },
+  "summary_fields": {
+    "date": "日期", "item_count": "明细数", "daily_amount": "当日金额", "status": "状态", "note": "备注"
+  },
+  "photo_scan_recursive": false
+}
