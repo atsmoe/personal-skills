@@ -4,11 +4,13 @@
 
 ## 已收录
 
-| 技能 | 版本 | 用途 |
-|---|---|---|
-| [照片转采购明细](skills/photo-purchase-ledger/SKILL.md) | G1.1 | 本地按图汇总、准确量价、批价上限拆分及单元格图片；按任务增量更新与分别验收本地、腾讯在线采购表。 |
-| [腾讯每日采购](skills/photo-purchase-tencent-daily/SKILL.md) | 1.1.0 | 单日腾讯 SHEET／SmartSheet 采购增量、写前冲突检查、图片缓存及当天汇总读回。 |
-| [剧组报销](skills/prepare-reimbursement-submission/SKILL.md) | 1.1.0 | 完整报销提交包及按需加载的铁路客票附件整理、工作簿核验；保护原件与候选输出。 |
+| 技能 | 原仓库版本（基线） | G系列修订 | 用途 |
+|---|---|---|---|
+| [照片转采购明细](skills/photo-purchase-ledger/SKILL.md) | 2.5.0 | G1.1 | 本地按图汇总、准确量价、批价上限拆分及单元格图片；按任务增量更新与分别验收本地、腾讯在线采购表。 |
+| [腾讯每日采购](skills/photo-purchase-tencent-daily/SKILL.md) | 1.1.0 | — | 单日腾讯 SHEET／SmartSheet 采购增量、写前冲突检查、图片缓存及当天汇总读回。 |
+| [剧组报销](skills/prepare-reimbursement-submission/SKILL.md) | 1.1.0 | — | 完整报销提交包及按需加载的铁路客票附件整理、工作簿核验；保护原件与候选输出。 |
+
+原仓库数字版本与G系列规则修订分别记录、独立递增。采购技能当前以原仓库 **2.5.0** 为基线，叠加 **G1.1** 规则；G编号不替换原仓库版本。技能元数据分别使用 `metadata.version` 与 `metadata.g_version`。仅整理版本标识时，两套编号都不递增。
 
 只阅读当前任务所需参考，不默认加载全部源码或重识别历史图片。脚本成功不等于在线同步、票面核实或 Excel 打开验收成功。
 
