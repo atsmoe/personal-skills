@@ -6,7 +6,7 @@
 
 | 技能 | 版本 | 用途 |
 |---|---|---|
-| [照片转采购明细](skills/photo-purchase-ledger/SKILL.md) | 2.5.0 | 有界摘要、采购组重定位、固定执行与失败接续；分别验收本地及腾讯在线采购表，保留历史与协作者增补。 |
+| [照片转采购明细](skills/photo-purchase-ledger/SKILL.md) | G1.1 | 本地按图汇总、准确量价、批价上限拆分及单元格图片；按任务增量更新与分别验收本地、腾讯在线采购表。 |
 | [腾讯每日采购](skills/photo-purchase-tencent-daily/SKILL.md) | 1.1.0 | 单日腾讯 SHEET／SmartSheet 采购增量、写前冲突检查、图片缓存及当天汇总读回。 |
 | [剧组报销](skills/prepare-reimbursement-submission/SKILL.md) | 1.1.0 | 完整报销提交包及按需加载的铁路客票附件整理、工作簿核验；保护原件与候选输出。 |
 
